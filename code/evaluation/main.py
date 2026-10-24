@@ -66,6 +66,9 @@ def custom_checks(agent) -> list[tuple[str, bool, str]]:
     cases = [
         ("non-deletion marketing opt-out", "Please stop sending marketing emails.", False),
         ("Japanese account deletion", "このアカウントの完全な削除をお願いします。", True),
+        ("Portuguese account erasure", "Solicito a exclusão permanente da minha conta.", True),
+        ("Portuguese negated erasure", "Não exclua minha conta; quero continuar usando o serviço.", False),
+        ("Japanese negated erasure", "アカウントを削除しないでください。", False),
         ("previously deleted account verification", "Please confirm the account is gone and the profile was removed.", True),
     ]
     for name, text, expected in cases:
@@ -116,8 +119,12 @@ def write_report(sample: dict[str, object], custom: list[tuple[str, bool, str]])
              f"- Status disagreements on the public sample: {len(failures)} cases ({', '.join(failures) if failures else 'none'}).",
              "- Initial parsing treated any email field as an email-delivery log and lost resource types; category resolution now prioritizes explicit policy categories, tombstones, and source collection names.",
              "- Started/completed log entries were initially evaluated independently; they are now grouped by trace ID so lookup identifiers and completion state are evaluated together.",
-             "- Added multilingual deletion intent handling, historical email resolution, exact user-ID boundaries, policy-specific actions, and time cutoff filtering.",
-             "- Remaining limitations: image OCR is optional and requires `pytesseract` plus a Tesseract installation; later evidence is intentionally excluded when it is after `audit_at`, even where the supplied sample answer cites it.",
+             "- Handover records with leading bullets were missed; the parser now reads both plain and bullet-prefixed records and maps support attachments to the attachment policy.",
+             "- The alias index can use substring hits for retrieval, but exact identity boundaries are now checked before a record can seed resource expansion.",
+             "- Added Portuguese deletion and negation handling plus Japanese negation checks; all eight authored checks now pass.",
+             "- Account absence can be supported by a uniquely time-correlated account deletion event and an exhaustive SQL profile snapshot; activity results themselves remain claims.",
+             "- JSON-formatted service log lines now retain their service, resource, and restore eligibility fields.",
+             "- Remaining limitations: one public sample status disagreement remains because the account resource is not linked to the subject by participant evidence. Image OCR requires `pytesseract` plus a Tesseract installation. Later evidence is intentionally excluded when it is after `audit_at`, even where the supplied sample answer cites it.",
              ""]
     REPORT.write_text("\n".join(rows), encoding="utf-8")
 

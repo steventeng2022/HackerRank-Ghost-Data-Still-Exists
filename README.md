@@ -22,7 +22,7 @@ The engine uses the Python standard library for CSV, JSON, and SQLite-compatible
 python -m pip install -r code/requirements.txt
 ```
 
-The evidence parser resolves current and historical identifiers, reads timestamps from the evidence manifest and records, groups log events by trace ID, applies the deletion policy, and emits only allowed operations in the contract order. `reported_status` and activity operation results are not accepted as proof of final state. `audit_at` limits evidence used for each request.
+The evidence parser resolves current and historical identifiers, reads timestamps from the evidence manifest and records, groups log events by trace ID, reads bullet-prefixed handover records and JSON-formatted service logs, applies the deletion policy, and emits only allowed operations in the contract order. A uniquely time-correlated account deletion event can locate an account resource in an exhaustive SQL snapshot; the snapshot, not the activity result, proves absence. `reported_status` and activity operation results are not accepted as proof of final state. `audit_at` limits evidence used for each request.
 
 ## Evaluation
 

@@ -3,6 +3,8 @@
 ## Final full-dataset run
 
 - Requests processed: 518.
+- Output status counts: 129 `COMPLETE`, 382 `INCOMPLETE`, and 7 `NOT_APPLICABLE`.
+- Run date: 2026-10-25.
 - Model providers: none; the solution uses deterministic Python rules and local evidence parsing.
 - Model names and model calls: none; 0 calls.
 - Input tokens: 0.

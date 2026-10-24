@@ -156,6 +156,8 @@ def category_for(system: str, table: str = "", obj: dict[str, Any] | None = None
         return "SEARCH_INDEX_ENTRY"
     if "cache" in low:
         return "CACHE_ENTRY"
+    if "attachment" in low:
+        return "SUPPORT_ATTACHMENT"
     if "support" in low or "ticket" in low or "conversation" in low or "attachment" in low:
         return "SUPPORT_MESSAGE"
     if "analytics" in low:
@@ -350,10 +352,40 @@ def extract_text_observations(file_id: str, text: str, suffix: str,
         trace_context: dict[str, list[str]] = {}
         for line in text.splitlines():
             trace_match_context = re.search(r"\btrace_id=([a-z0-9-]+)", line, re.I)
+            json_record: dict[str, Any] | None = None
+            json_text = line[line.find("{"):].strip() if "{" in line else ""
+            if json_text.startswith("{"):
+                try:
+                    candidate = json.loads(json_text)
+                    if isinstance(candidate, dict):
+                        json_record = candidate
+                        if not trace_match_context and candidate.get("trace_id"):
+                            trace_match_context = re.search(r".+", str(candidate["trace_id"]))
+                except json.JSONDecodeError:
+                    pass
             if trace_match_context:
-                trace_context.setdefault(trace_match_context.group(1), []).append(line)
+                trace_name = (str(json_record["trace_id"]) if json_record and json_record.get("trace_id")
+                              else trace_match_context.group(1))
+                trace_context.setdefault(trace_name, []).append(line)
+            if json_record:
+                resource_id = str(json_record.get("resource_id", ""))
+                if resource_id:
+                    prefix_time = re.match(r"\s*(20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ)", line)
+                    timestamp = (parse_time(json_record.get("observed_at") or json_record.get("event_time"))
+                                 or (parse_time(prefix_time.group(1)) if prefix_time else None)
+                                 or fallback_time)
+                    system = system_for("", str(json_record.get("service") or json_record.get("logger") or ""))
+                    event = str(json_record.get("event", "")).casefold()
+                    category = category_for(system, event, json_record)
+                    state = state_from_line(line, event)
+                    if not state:
+                        state = state_from_record(json_record)
+                    parsed.append(Observation(file_id, timestamp, system, resource_id,
+                        category, line, source_type="line", explicit_state=state,
+                        evidence_id=file_id, activity_event=event))
+                continue
             # Shift-handover exports use pipe-delimited, already-classified rows.
-            pipe = re.match(r"\s*(20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*(.+)$", line)
+            pipe = re.match(r"\s*(?:[-*]\s*)?(20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*(.+)$", line)
             if pipe:
                 ts, system_text, resource, category_text, state_text, _subject = [x.strip() for x in pipe.groups()]
                 state_value = state_text.upper()
@@ -421,6 +453,9 @@ def state_from_line(line: str, event: str) -> str:
         return "DISABLED" if "enabled=" in low else "BLOCKED"
     if re.search(r"\b(enabled=(true|1)|restore_allowed=(true|1)|restore_access=(allowed|true))\b", low):
         return "ACTIVE" if "enabled=" in low else "RESTORE_ALLOWED"
+    if (re.search(r"[\"']?eligible[\"']?\s*[:=]\s*[\"']?true\b", low)
+            and re.search(r"[\"']?deletion_block[\"']?\s*[:=]\s*[\"']?false\b", low)):
+        return "RESTORE_ALLOWED"
     if "redacted" in low:
         return "REDACTED"
     if "anonymized" in low or "anonymised" in low:
@@ -503,10 +538,15 @@ def is_deletion_request(text: str) -> bool:
     t = norm(text)
     if re.search(r"\b(do not|don't|dont|never|no quiero|ne veux pas|ne souhaite pas)\b.{0,50}\b(delete|erase|remove|close|delet|effac|suppression|elimin|borra|elimina)\b", t):
         return False
+    if re.search(r"\b(não|nao)\b.{0,60}\b(exclu\w*|apag\w*|delet\w*|remov\w*|elimin\w*)\b", t):
+        return False
+    if any(term in t for term in ("削除しない", "消さない", "削除不要", "削除は希望しない",
+                                  "删除不要", "不删除", "不要删除", "刪除不要", "不刪除", "不要刪除")):
+        return False
     if any(term in t for term in ("削除", "删除", "刪除", "消去", "삭제", "消除")):
         return True
     delete_terms = (
-        r"\b(delete|delet|erase|erasure|remove|removal|close|closure|wipe|purge|forget|suppression|supprimer|effacer|effacement|eliminar|eliminaci[oó]n|borrar|borre|borrado|l[oö]schen|entfernen|verwijder|verwijderen|hapus|padam|删除|刪除|削除|消去|계정.*삭제)\w*\b",
+        r"\b(delete|delet|erase|erasure|remove|removal|close|closure|wipe|purge|forget|suppression|supprimer|effacer|effacement|eliminar|eliminaci[oó]n|borrar|borre|borrado|l[oö]schen|entfernen|verwijder|verwijderen|hapus|padam|exclus[aã]o|excluir|exclua|excluo|apag\w*|删除|刪除|削除|消去|계정.*삭제)\w*\b",
     )
     if any(re.search(pattern, t, re.I) for pattern in delete_terms):
         return True
@@ -558,7 +598,7 @@ def map_record_state(obs: Observation, aliases: set[str], user_id: str, cutoff: 
                     "evidence": obs.evidence_id, "timestamp": obs.timestamp, "pii": pii}
         return None
     if category == "BACKUP_ARCHIVE":
-        if state == "RESTORE_ALLOWED":
+        if state in {"RESTORE_ALLOWED", "ACTIVE"}:
             return {"system": obs.system_id, "resource": obs.resource_id, "category": category,
                     "treatment": "RESTORE_RISK", "operation": "REPORT_RESTORE_RISK", "state": "ACTIVE",
                     "evidence": obs.evidence_id, "timestamp": obs.timestamp, "pii": pii}
@@ -752,6 +792,102 @@ def indexed_candidates(aliases: set[str], index: dict[str, list[Any]]) -> list[A
     return list(unique.values())
 
 
+def temporal_activity_links(requests: list[dict[str, str]],
+                            activities: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    """Use a uniquely nearest reported_at event to locate a resource for a case.
+
+    The activity result is not treated as state proof. This is a conservative
+    join for evidence that omits identifiers after deletion/redaction: an event
+    must fall within ten minutes of exactly one request's report time, and the
+    request must be the event's unique nearest report among all requests.
+    """
+    # Account profile deletion events are the only temporal joins used here:
+    # they can identify the lookup key for an exhaustive account snapshot even
+    # when the row itself is absent. Other resource types need a direct identity
+    # link because their events may be adjacent to unrelated work in a batch.
+    event_types = {"DELETE_RECORD"}
+    authorized = {r["case_id"]: r for r in requests
+                  if is_deletion_request(r.get("request_text", ""))}
+    linked: dict[str, list[dict[str, str]]] = {case_id: [] for case_id in authorized}
+    request_times = {r["case_id"]: parse_time(r.get("reported_at")) for r in requests}
+    for activity in activities:
+        if activity.get("event_type", "").upper() not in event_types:
+            continue
+        if activity.get("target_system") != "account_service":
+            continue
+        event_time = parse_time(activity.get("event_time"))
+        if event_time is None:
+            continue
+        distances = []
+        for row in requests:
+            report_time = request_times[row["case_id"]]
+            requested_time = parse_time(row.get("requested_at"))
+            audit_time = parse_time(row.get("audit_at"))
+            if report_time is None or requested_time is None or audit_time is None:
+                continue
+            if not requested_time <= event_time <= audit_time:
+                continue
+            distances.append((abs((event_time - report_time).total_seconds()), row["case_id"]))
+        if not distances:
+            continue
+        distances.sort()
+        nearest_distance = distances[0][0]
+        nearest_cases = [case_id for distance, case_id in distances
+                         if distance == nearest_distance]
+        if nearest_distance > 600 or len(nearest_cases) != 1:
+            continue
+        case_id = nearest_cases[0]
+        if case_id in authorized:
+            linked[case_id].append(activity)
+    return linked
+
+
+def account_profile_snapshots(dataset: Path,
+                              manifest: dict[str, dict[str, str]]) -> list[tuple[dt.datetime, str, set[str]]]:
+    """Load full account-profile tables once so absence checks stay inexpensive."""
+    snapshots: list[tuple[dt.datetime, str, set[str]]] = []
+    for file_id, meta in manifest.items():
+        path = dataset / Path(meta.get("file_path", ""))
+        captured = parse_time(meta.get("captured_at"))
+        if path.suffix.casefold() != ".sql" or captured is None:
+            continue
+        try:
+            db = sqlite3.connect(":memory:")
+            try:
+                db.executescript(path.read_text(encoding="utf-8", errors="replace"))
+                tables = [row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+                    if re.search(r"customer_profiles(?:_|$)", row[0], re.I)]
+                if not tables:
+                    continue
+                present_ids: set[str] = set()
+                for table in tables:
+                    columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
+                    if "resource_id" not in columns:
+                        continue
+                    present_ids.update(row[0] for row in db.execute(
+                        f'SELECT resource_id FROM "{table}"'))
+                snapshots.append((captured, file_id, present_ids))
+            finally:
+                db.close()
+        except sqlite3.Error:
+            continue
+    return snapshots
+
+
+def sql_account_absence(snapshots: list[tuple[dt.datetime, str, set[str]]],
+                        resource_id: str, cutoff: dt.datetime) -> Observation | None:
+    """Prove an account lookup absent from a complete account-profile SQL snapshot."""
+    eligible = [(captured, file_id) for captured, file_id, present in snapshots
+                if captured <= cutoff and resource_id not in present]
+    if not eligible:
+        return None
+    captured, file_id = max(eligible)
+    return Observation(file_id, captured, "account_service", resource_id,
+        "USER_PROFILE", {"resource_id": resource_id, "status": "NOT_FOUND"},
+        explicit_state="ABSENT", evidence_id=file_id)
+
+
 def choose_latest_observations(observations: list[Observation], aliases: set[str],
                                user_id: str, cutoff: dt.datetime,
                                activities: list[dict[str, str]],
@@ -771,7 +907,10 @@ def choose_latest_observations(observations: list[Observation], aliases: set[str
         mapped["timestamp"] = obs.timestamp
         mapped["evidence"] = obs.evidence_id
         mapped["activity_event"] = obs.activity_event
-        key = (mapped["system"], mapped["resource"])
+        # Resource identifiers are platform-wide unique in the evidence set.
+        # Some exports and JSON log lines describe the same resource under an
+        # incomplete system hint; collapsing by resource avoids duplicate work.
+        key = ("", mapped["resource"])
         grouped.setdefault(key, []).append(mapped)
     ranks = {"ABSENT": 6, "DISABLED": 6, "BLOCKED": 6,
              "ANONYMIZED": 5, "REDACTED": 5, "PRESENT": 4, "ACTIVE": 4}
@@ -859,10 +998,9 @@ def create_case_steps(case: dict[str, str], users: list[dict[str, str]],
         # No identity or state evidence cannot establish deletion completeness.
         incomplete = True
 
-    def order(item: dict[str, Any], phase: str) -> tuple[int, int, str, str]:
+    def order(item: dict[str, Any], phase: str) -> tuple[int, str, str]:
         op = item["operation"]
-        return (OP_ORDER.get(op, 99), SYSTEM_ORDER.get(item["system"], 99),
-                item["system"], item["resource"])
+        return (OP_ORDER.get(op, 99), item["system"], item["resource"])
 
     steps: list[dict[str, Any]] = []
     if incomplete:
@@ -909,21 +1047,56 @@ def run(dataset: Path = DATASET, output: Path = OUTPUT,
     rules = read_csv(dataset / "deletion_rules.csv")
     for rule in rules:
         ACTION[rule["data_category"]] = rule["required_action"]
-    observations, _, _ = load_evidence(dataset)
+    observations, manifest, _ = load_evidence(dataset)
     aliases = all_known_aliases(users, audits) | {r.get("email", "") for r in requests}
     evidence_index = build_alias_index(observations, aliases, lambda x: x.search_text)
     activity_aliases = {r.get("email", "") for r in requests} | all_known_aliases(users, audits)
     activity_index = build_alias_index(activities, activity_aliases,
                                        lambda x: x.get("details", ""))
+    temporal_links = temporal_activity_links(requests, activities)
+    account_snapshots = account_profile_snapshots(dataset, manifest)
     rows = []
     for case in sorted(requests, key=lambda x: x["case_id"]):
         _, case_aliases = resolve_identity(case.get("email", ""), users, audits,
             parse_time(case.get("audit_at")) or dt.datetime.max.replace(tzinfo=dt.timezone.utc))
-        candidates = indexed_candidates(case_aliases, evidence_index)
+        # The index is deliberately permissive so it can find names embedded in
+        # prose. Confirm exact identity boundaries before using a record to seed
+        # resource-level expansion; otherwise a short name can pull in a longer,
+        # unrelated name that happens to share its prefix.
+        case_user, _ = resolve_identity(case.get("email", ""), users, audits,
+            parse_time(case.get("audit_at")) or dt.datetime.max.replace(tzinfo=dt.timezone.utc))
+        case_uid = case_user.get("user_id", "") if case_user else ""
+        candidates = [x for x in indexed_candidates(case_aliases, evidence_index)
+                      if isinstance(x, Observation)
+                      and record_mentions(x, case_aliases, case_uid)[0]]
+        linked_actions = temporal_links.get(case["case_id"], [])
+        action_resources = {a.get("resource_id", "") for a in linked_actions
+                            if a.get("resource_id")}
+        candidate_ids = {id(x) for x in candidates}
+        candidate_resources = {x.resource_id for x in candidates if x.resource_id}
+        candidates.extend(x for x in observations
+                          if x.resource_id in action_resources
+                          and x.at_or_before(parse_time(case.get("audit_at"))
+                              or dt.datetime.max.replace(tzinfo=dt.timezone.utc))
+                          and id(x) not in candidate_ids)
+        candidate_ids = {id(x) for x in candidates}
+        candidate_resources = {x.resource_id for x in candidates if x.resource_id}
+        cutoff = parse_time(case.get("audit_at")) or dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        for action in linked_actions:
+            resource = action.get("resource_id", "")
+            if (resource and action.get("target_system") == "account_service"
+                    and action.get("event_type", "").upper() == "DELETE_RECORD"
+                    and resource not in candidate_resources):
+                absent = sql_account_absence(account_snapshots, resource, cutoff)
+                if absent:
+                    candidates.append(absent)
+                    candidate_resources.add(resource)
         # Once a record is linked to an identity, collect every time-bounded
         # observation for that resource. A later service export may omit PII but
         # still provide the authoritative current state for the same ID.
-        linked_resources = {x.resource_id for x in candidates if isinstance(x, Observation) and x.resource_id}
+        linked_resources = ({x.resource_id for x in candidates
+                             if isinstance(x, Observation) and x.resource_id}
+                            | action_resources)
         if linked_resources:
             already = {id(x) for x in candidates}
             candidates.extend(x for x in observations
